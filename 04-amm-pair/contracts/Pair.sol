@@ -6,6 +6,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 contract Pair is ERC20 {
     uint256 public constant MINIMUM_LIQUIDITY = 1000;
+    address private constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     IERC20 public immutable token0;
     IERC20 public immutable token1;
@@ -28,19 +29,93 @@ contract Pair is ERC20 {
     }
 
     function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) public pure returns (uint256) {
-        // TODO
+        if (amountIn == 0) revert InsufficientAmount();
+        if (reserveIn == 0 || reserveOut == 0) revert InsufficientLiquidity();
+
+        uint256 amountInWithFee = amountIn * 997;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = (reserveIn * 1000) + amountInWithFee;
+
+        return numerator / denominator;
     }
 
     function addLiquidity(uint256 amount0, uint256 amount1) external returns (uint256 liquidity) {
-        // TODO
+        if (amount0 == 0 || amount1 == 0) revert InsufficientAmount();
+
+        token0.transferFrom(msg.sender, address(this), amount0);
+        token1.transferFrom(msg.sender, address(this), amount1);
+
+        uint256 _totalSupply = totalSupply();
+        if (_totalSupply == 0) {
+            uint256 rootK = _sqrt(amount0 * amount1);
+            if (rootK <= MINIMUM_LIQUIDITY) revert InsufficientLiquidity();
+
+            liquidity = rootK - MINIMUM_LIQUIDITY;
+            // OpenZeppelin v5 ERC20 disallows _mint(address(0), ...), so permanently lock to DEAD_ADDRESS
+            _mint(DEAD_ADDRESS, MINIMUM_LIQUIDITY);
+        } else {
+            liquidity = _min(
+                (amount0 * _totalSupply) / reserve0,
+                (amount1 * _totalSupply) / reserve1
+            );
+        }
+
+        if (liquidity == 0) revert InsufficientLiquidity();
+
+        _mint(msg.sender, liquidity);
+
+        reserve0 += amount0;
+        reserve1 += amount1;
+
+        emit LiquidityAdded(msg.sender, amount0, amount1, liquidity);
     }
 
     function removeLiquidity(uint256 liquidity) external returns (uint256 amount0, uint256 amount1) {
-        // TODO
+        if (liquidity == 0) revert InsufficientAmount();
+
+        uint256 _totalSupply = totalSupply();
+        if (_totalSupply == 0) revert InsufficientLiquidity();
+
+        amount0 = (liquidity * reserve0) / _totalSupply;
+        amount1 = (liquidity * reserve1) / _totalSupply;
+
+        if (amount0 == 0 || amount1 == 0) revert InsufficientLiquidity();
+
+        _burn(msg.sender, liquidity);
+
+        reserve0 -= amount0;
+        reserve1 -= amount1;
+
+        token0.transfer(msg.sender, amount0);
+        token1.transfer(msg.sender, amount1);
+
+        emit LiquidityRemoved(msg.sender, amount0, amount1, liquidity);
     }
 
     function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut) external returns (uint256 amountOut) {
-        // TODO
+        bool isToken0 = (tokenIn == address(token0));
+        if (!isToken0 && tokenIn != address(token1)) revert InvalidToken();
+
+        (uint256 reserveIn, uint256 reserveOut) = isToken0
+            ? (reserve0, reserve1)
+            : (reserve1, reserve0);
+
+        amountOut = getAmountOut(amountIn, reserveIn, reserveOut);
+        if (amountOut < minAmountOut) revert InsufficientOutput();
+
+        if (isToken0) {
+            token0.transferFrom(msg.sender, address(this), amountIn);
+            token1.transfer(msg.sender, amountOut);
+            reserve0 += amountIn;
+            reserve1 -= amountOut;
+        } else {
+            token1.transferFrom(msg.sender, address(this), amountIn);
+            token0.transfer(msg.sender, amountOut);
+            reserve1 += amountIn;
+            reserve0 -= amountOut;
+        }
+
+        emit Swapped(msg.sender, tokenIn, amountIn, amountOut);
     }
 
     function _sqrt(uint256 y) internal pure returns (uint256 z) {
