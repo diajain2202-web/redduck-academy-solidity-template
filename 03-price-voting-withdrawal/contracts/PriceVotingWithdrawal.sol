@@ -4,49 +4,55 @@ pragma solidity 0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /*
- * Required Call Order:
+ * Required Call Order (Claim-and-Challenge Settlement):
  * 1. Voting & Withdrawal Window (`block.timestamp < votingEnd`):
  *    - Voters approve this contract on `token` and call `vote(price, amount)`
  *      one or more times across any prices.
  *    - Voters may call `withdraw(price, amount)` at any time to reclaim part
  *      or all of their tokens locked on `price`. Withdrawals before `votingEnd`
- *      reduce that price's active vote weight and update the max-heap;
- *      withdrawals at or after `votingEnd` return locked tokens without
- *      altering final weights.
- * 2. Settlement (`block.timestamp >= votingEnd`):
- *    - Anyone calls `finalize()` once to record the winning price in O(1)
+ *      reduce `_weightOf[price]`; withdrawals at or after `votingEnd` return
+ *      locked tokens without altering final weights.
+ * 2. Claim-and-Challenge Window (`votingEnd <= block.timestamp < votingEnd + CHALLENGE_PERIOD`):
+ *    - Anyone calls `proposeWinner(price)` to claim the highest-weight price
+ *      computed off-chain.
+ *    - If a higher-weight price exists (or a distinct price ties the current
+ *      candidate's weight), anyone can challenge by calling `proposeWinner(otherPrice)`
+ *      before `challengeEnd()` (`votingEnd + CHALLENGE_PERIOD`).
+ * 3. Finalization (`block.timestamp >= votingEnd + CHALLENGE_PERIOD`):
+ *    - Anyone calls `finalize()` once to lock in `currentTokenPrice()` in O(1)
  *      time and emit `PriceFinalized`.
- * 3. Reading Result:
+ * 4. Reading Result:
  *    - Call `finalized()` and `currentTokenPrice()` to read the settled price.
  *
  * Tie-Breaking Rule:
- * - If two or more prices share the highest positive weight when `finalize()`
- *   is called (a tie), or if no positive-weight votes remain, there is no
- *   unique winner: `currentTokenPrice()` remains `0` and `PriceFinalized(0, 0)`
- *   is emitted.
+ * - If two or more distinct prices share the highest positive weight when the
+ *   challenge window closes (`_candidateTied == true`), or if no positive-weight
+ *   candidate was proposed, there is no unique winner: `currentTokenPrice()`
+ *   remains `0` and `PriceFinalized(0, 0)` is emitted.
  *
  * Reflection:
- * 1. Chosen Implementation Strategy (Per-Price Voter Bookkeeping + On-Chain
- *    Binary Max-Heap):
- *    - Tracking `_lockedOf[voter][price]` lets `withdraw(price, amount)` know
- *      the exact price weight to decrement and prevents a voter from
- *      withdrawing tokens locked on one price against another price.
- *    - Maintaining a binary max-heap (`_heap` with 1-based `_heapIndex`) keeps
- *      the highest-weight price at `_heap[0]` in O(log N) per `vote` (`_siftUp`)
- *      and O(log N) per `withdraw` (`_siftDown`), avoiding any O(N) linear scan
- *      over voter-controlled prices in `finalize()`.
- *    - In a binary max-heap, the second-largest weight is guaranteed to be at
- *      `_heap[1]` or `_heap[2]`, allowing `finalize()` and `leader()` to verify
- *      whether `_heap[0]` is a strict winner or tied in strict O(1) time.
+ * 1. Chosen Implementation Strategy (O(1) Mapping Bookkeeping + Optimistic
+ *    Claim-and-Challenge Settlement):
+ *    - Tracking `_lockedOf[voter][price]` lets `withdraw(price, amount)` decrement
+ *      the exact price weight in O(1) and prevents withdrawing tokens locked on
+ *      one price against another.
+ *    - Using a post-voting `proposeWinner(price)` claim-and-challenge step followed
+ *      by `finalize()` completely eliminates all loops over voter-controlled
+ *      prices: every state-changing function (`vote`, `withdraw`, `proposeWinner`,
+ *      `finalize`) executes in strict O(1) gas regardless of how many distinct
+ *      prices voters propose.
  *
  * 2. Why the Simpler Pattern from `02-price-voting` Breaks Here:
  *    - In `02-price-voting`, `_leaderPrice` and `_leaderWeight` only updated
- *      upward (`if (newWeight > _leaderWeight)`). With withdrawals, reducing
- *      the leader's weight below a runner-up leaves `_leaderPrice` pointing to
- *      a stale loser, and withdrawing from a tied competitor breaks a tie that
- *      monotonic tracking cannot resolve across an unbounded `uint256` space.
+ *      monotonically upward during `vote()`. Once mid-voting withdrawals are
+ *      permitted, reducing the leader's weight below a runner-up leaves
+ *      `_leaderPrice` pointing to a stale loser, and withdrawing from a tied
+ *      competitor resolves a tie that monotonic tracking cannot detect over an
+ *      unbounded `uint256` price space.
  */
 contract PriceVotingWithdrawal {
+    uint256 public constant CHALLENGE_PERIOD = 1 hours;
+
     IERC20 private immutable _token;
     uint256 private immutable _votingEnd;
 
@@ -54,23 +60,28 @@ contract PriceVotingWithdrawal {
     mapping(address => mapping(uint256 => uint256)) private _lockedOf;
     mapping(address => uint256) private _totalLockedOf;
 
-    // Max-heap of proposed prices ordered by `_weightOf[price]`.
-    // `_heapIndex[price]` stores the 1-based index into `_heap` (0 = absent).
-    uint256[] private _heap;
-    mapping(uint256 => uint256) private _heapIndex;
+    uint256 private _candidatePrice;
+    uint256 private _candidateWeight;
+    bool private _hasCandidate;
+    bool private _candidateTied;
 
     uint256 private _currentTokenPrice;
     bool private _finalized;
 
     error VotingEnded();
     error VotingActive();
+    error ChallengePeriodEnded();
+    error ChallengePeriodActive();
     error AlreadyFinalized();
     error ZeroAmount();
+    error ZeroWeightPrice();
+    error CandidateNotBetter();
     error InsufficientLockedBalance();
     error TransferFailed();
 
     event Voted(address indexed voter, uint256 indexed price, uint256 amount);
     event Withdrawn(address indexed voter, uint256 indexed price, uint256 amount);
+    event WinnerProposed(address indexed proposer, uint256 indexed price, uint256 weight);
     event PriceFinalized(uint256 indexed price, uint256 weight);
 
     constructor(IERC20 token_, uint256 votingEnd_) {
@@ -91,14 +102,6 @@ contract PriceVotingWithdrawal {
         _totalLockedOf[msg.sender] += amount;
         _weightOf[price] += amount;
 
-        uint256 idx = _heapIndex[price];
-        if (idx == 0) {
-            _heap.push(price);
-            idx = _heap.length;
-            _heapIndex[price] = idx;
-        }
-        _siftUp(idx - 1);
-
         emit Voted(msg.sender, price, amount);
     }
 
@@ -108,16 +111,12 @@ contract PriceVotingWithdrawal {
         uint256 locked = _lockedOf[msg.sender][price];
         if (locked < amount) revert InsufficientLockedBalance();
 
-        // Effects before external interaction (Checks-Effects-Interactions)
+        // Checks-Effects-Interactions: update all state before external token transfer
         _lockedOf[msg.sender][price] = locked - amount;
         _totalLockedOf[msg.sender] -= amount;
 
         if (block.timestamp < _votingEnd) {
             _weightOf[price] -= amount;
-            uint256 idx = _heapIndex[price];
-            if (idx > 0) {
-                _siftDown(idx - 1);
-            }
         }
 
         bool ok = _token.transfer(msg.sender, amount);
@@ -126,17 +125,36 @@ contract PriceVotingWithdrawal {
         emit Withdrawn(msg.sender, price, amount);
     }
 
-    function finalize() external {
+    function proposeWinner(uint256 price) external {
         if (block.timestamp < _votingEnd) revert VotingActive();
+        if (block.timestamp >= _votingEnd + CHALLENGE_PERIOD) revert ChallengePeriodEnded();
+
+        uint256 weight = _weightOf[price];
+        if (weight == 0) revert ZeroWeightPrice();
+
+        if (!_hasCandidate || weight > _candidateWeight) {
+            _candidatePrice = price;
+            _candidateWeight = weight;
+            _hasCandidate = true;
+            _candidateTied = false;
+        } else if (weight == _candidateWeight && price != _candidatePrice && !_candidateTied) {
+            _candidateTied = true;
+        } else {
+            revert CandidateNotBetter();
+        }
+
+        emit WinnerProposed(msg.sender, price, weight);
+    }
+
+    function finalize() external {
+        if (block.timestamp < _votingEnd + CHALLENGE_PERIOD) revert ChallengePeriodActive();
         if (_finalized) revert AlreadyFinalized();
 
         _finalized = true;
 
-        (uint256 bestPrice, uint256 bestWeight, bool tied) = _computeLeader();
-
-        if (bestWeight > 0 && !tied) {
-            _currentTokenPrice = bestPrice;
-            emit PriceFinalized(bestPrice, bestWeight);
+        if (_hasCandidate && _candidateWeight > 0 && !_candidateTied) {
+            _currentTokenPrice = _candidatePrice;
+            emit PriceFinalized(_candidatePrice, _candidateWeight);
         } else {
             emit PriceFinalized(0, 0);
         }
@@ -152,6 +170,10 @@ contract PriceVotingWithdrawal {
         return _votingEnd;
     }
 
+    function challengeEnd() external view returns (uint256) {
+        return _votingEnd + CHALLENGE_PERIOD;
+    }
+
     function weightOf(uint256 price) external view returns (uint256) {
         return _weightOf[price];
     }
@@ -165,7 +187,10 @@ contract PriceVotingWithdrawal {
     }
 
     function leader() external view returns (uint256 price, uint256 weight) {
-        (price, weight, ) = _computeLeader();
+        if (!_hasCandidate || _candidateTied) {
+            return (0, 0);
+        }
+        return (_candidatePrice, _candidateWeight);
     }
 
     function currentTokenPrice() external view returns (uint256) {
@@ -174,90 +199,5 @@ contract PriceVotingWithdrawal {
 
     function finalized() external view returns (bool) {
         return _finalized;
-    }
-
-    // ----- internal helpers -----
-
-    function _computeLeader() internal view returns (uint256 bestPrice, uint256 bestWeight, bool tied) {
-        uint256 len = _heap.length;
-        if (len == 0) {
-            return (0, 0, false);
-        }
-
-        bestPrice = _heap[0];
-        bestWeight = _weightOf[bestPrice];
-
-        if (bestWeight == 0) {
-            return (0, 0, false);
-        }
-
-        if (len > 1) {
-            uint256 runnerUpWeight = _weightOf[_heap[1]];
-            if (len > 2) {
-                uint256 rightWeight = _weightOf[_heap[2]];
-                if (rightWeight > runnerUpWeight) {
-                    runnerUpWeight = rightWeight;
-                }
-            }
-            if (runnerUpWeight == bestWeight) {
-                return (0, bestWeight, true);
-            }
-        }
-
-        return (bestPrice, bestWeight, false);
-    }
-
-    function _siftUp(uint256 pos) internal {
-        uint256 price = _heap[pos];
-        uint256 weight = _weightOf[price];
-
-        while (pos > 0) {
-            uint256 parentPos = (pos - 1) / 2;
-            uint256 parentPrice = _heap[parentPos];
-            if (weight <= _weightOf[parentPrice]) {
-                break;
-            }
-            _heap[pos] = parentPrice;
-            _heapIndex[parentPrice] = pos + 1;
-            pos = parentPos;
-        }
-
-        _heap[pos] = price;
-        _heapIndex[price] = pos + 1;
-    }
-
-    function _siftDown(uint256 pos) internal {
-        uint256 len = _heap.length;
-        uint256 price = _heap[pos];
-        uint256 weight = _weightOf[price];
-
-        while (true) {
-            uint256 left = 2 * pos + 1;
-            if (left >= len) break;
-
-            uint256 largestChild = left;
-            uint256 largestWeight = _weightOf[_heap[left]];
-
-            uint256 right = left + 1;
-            if (right < len) {
-                uint256 rightWeight = _weightOf[_heap[right]];
-                if (rightWeight > largestWeight) {
-                    largestChild = right;
-                    largestWeight = rightWeight;
-                }
-            }
-
-            if (weight >= largestWeight) {
-                break;
-            }
-
-            uint256 childPrice = _heap[largestChild];
-            _heap[pos] = childPrice;
-            _heapIndex[childPrice] = pos + 1;
-            pos = largestChild;
-        }
-
-        _heap[pos] = price;
-        _heapIndex[price] = pos + 1;
     }
 }

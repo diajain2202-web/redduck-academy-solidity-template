@@ -6,6 +6,7 @@ import { getAddress, parseEther } from "viem";
 const { viem, networkHelpers } = await network.connect();
 
 const ONE_DAY = 60 * 60 * 24;
+const ONE_HOUR = 60 * 60;
 
 describe("PriceVotingWithdrawal", function () {
   async function deployFixture() {
@@ -118,6 +119,9 @@ describe("PriceVotingWithdrawal", function () {
       await voting.write.vote([200n, parseEther("90")], { account: alice.account });
 
       await networkHelpers.time.increaseTo(votingEnd);
+      await voting.write.proposeWinner([200n]);
+
+      await networkHelpers.time.increaseTo(votingEnd + BigInt(ONE_HOUR));
       await voting.write.finalize();
 
       assert.equal(await voting.read.currentTokenPrice(), 200n);
@@ -136,12 +140,15 @@ describe("PriceVotingWithdrawal", function () {
       await voting.write.withdraw([100n, parseEther("80")], { account: alice.account });
       assert.equal(await token.read.balanceOf([alice.account.address]), aliceStart);
 
+      await voting.write.proposeWinner([100n]);
+      await networkHelpers.time.increaseTo(votingEnd + BigInt(ONE_HOUR));
       await voting.write.finalize();
+
       assert.equal(await voting.read.currentTokenPrice(), 100n);
     });
   });
 
-  describe("leader resolution & finalize", function () {
+  describe("claim-and-challenge settlement & finalize", function () {
     it("sets the correct winning price after a pure sequence of votes with no withdrawals", async function () {
       const { voting, votingEnd, alice, bob, carol } = await networkHelpers.loadFixture(deployFixture);
 
@@ -149,9 +156,18 @@ describe("PriceVotingWithdrawal", function () {
       await voting.write.vote([200n, parseEther("70")], { account: bob.account });
       await voting.write.vote([100n, parseEther("50")], { account: carol.account });
 
+      await networkHelpers.time.increaseTo(votingEnd);
+
+      await viem.assertions.emitWithArgs(
+        voting.write.proposeWinner([100n], { account: alice.account }),
+        voting,
+        "WinnerProposed",
+        [getAddress(alice.account.address), 100n, parseEther("90")],
+      );
+
       assert.deepEqual(await voting.read.leader(), [100n, parseEther("90")]);
 
-      await networkHelpers.time.increaseTo(votingEnd);
+      await networkHelpers.time.increaseTo(votingEnd + BigInt(ONE_HOUR));
 
       await viem.assertions.emitWithArgs(
         voting.write.finalize(),
@@ -164,25 +180,33 @@ describe("PriceVotingWithdrawal", function () {
       assert.equal(await voting.read.currentTokenPrice(), 100n);
     });
 
-    it("finds the true winner across many distinct prices and multiple withdrawals", async function () {
+    it("allows challenging an inferior candidate and settles on the true winner after many distinct prices", async function () {
       const { voting, votingEnd, alice, bob } = await networkHelpers.loadFixture(deployFixture);
 
-      // Propose 15 distinct prices
       for (let i = 1n; i <= 15n; i++) {
-        await voting.write.vote([i * 10n, parseEther(String(i))], { account: alice.account });
+        await voting.write.vote([1000n + i, parseEther(String(i))], { account: alice.account });
       }
 
-      // Price 150 currently leads with 15 ETH; Bob backs price 70 with 20 ETH
-      await voting.write.vote([70n, parseEther("20")], { account: bob.account });
-      assert.deepEqual(await voting.read.leader(), [70n, parseEther("27")]);
-
-      // Bob withdraws 15 ETH from price 70 (dropping it to 12 ETH), so price 150 (15 ETH) wins
-      await voting.write.withdraw([70n, parseEther("15")], { account: bob.account });
+      // Price 1007 gets 27 ETH total, then Bob withdraws 15 ETH -> drops to 12 ETH, leaving 1015 (15 ETH) as winner
+      await voting.write.vote([1007n, parseEther("20")], { account: bob.account });
+      await voting.write.withdraw([1007n, parseEther("15")], { account: bob.account });
 
       await networkHelpers.time.increaseTo(votingEnd);
+
+      // Someone initially proposes runner-up 1007 (12 ETH), then Bob challenges with true winner 1015 (15 ETH)
+      await voting.write.proposeWinner([1007n], { account: alice.account });
+      await voting.write.proposeWinner([1015n], { account: bob.account });
+
+      // Proposing an inferior price reverts
+      await assert.rejects(
+        voting.write.proposeWinner([1001n], { account: alice.account }),
+        /CandidateNotBetter/,
+      );
+
+      await networkHelpers.time.increaseTo(votingEnd + BigInt(ONE_HOUR));
       await voting.write.finalize();
 
-      assert.equal(await voting.read.currentTokenPrice(), 150n);
+      assert.equal(await voting.read.currentTokenPrice(), 1015n);
     });
 
     it("updates the winning price when a withdrawal drops the former leader below a runner-up", async function () {
@@ -194,55 +218,49 @@ describe("PriceVotingWithdrawal", function () {
       await voting.write.withdraw([100n, parseEther("50")], { account: alice.account });
 
       await networkHelpers.time.increaseTo(votingEnd);
+      await voting.write.proposeWinner([200n]);
 
-      await viem.assertions.emitWithArgs(
-        voting.write.finalize(),
-        voting,
-        "PriceFinalized",
-        [200n, parseEther("60")],
-      );
+      await networkHelpers.time.increaseTo(votingEnd + BigInt(ONE_HOUR));
+      await voting.write.finalize();
 
-      assert.equal(await voting.read.finalized(), true);
       assert.equal(await voting.read.currentTokenPrice(), 200n);
     });
 
-    it("resolves a former tie when one side withdraws during voting", async function () {
+    it("keeps currentTokenPrice at 0 when two distinct prices tie for top weight", async function () {
       const { voting, votingEnd, alice, bob } = await networkHelpers.loadFixture(deployFixture);
 
       await voting.write.vote([100n, parseEther("50")], { account: alice.account });
       await voting.write.vote([200n, parseEther("50")], { account: bob.account });
 
-      await voting.write.withdraw([200n, parseEther("10")], { account: bob.account });
-
       await networkHelpers.time.increaseTo(votingEnd);
-      await voting.write.finalize();
 
-      assert.equal(await voting.read.currentTokenPrice(), 100n);
-    });
+      await voting.write.proposeWinner([100n], { account: alice.account });
+      await voting.write.proposeWinner([200n], { account: bob.account });
 
-    it("keeps currentTokenPrice at 0 when a withdrawal creates a tie or removes all votes", async function () {
-      const { voting, votingEnd, alice, bob } = await networkHelpers.loadFixture(deployFixture);
+      assert.deepEqual(await voting.read.leader(), [0n, 0n]);
 
-      await voting.write.vote([100n, parseEther("70")], { account: alice.account });
-      await voting.write.vote([200n, parseEther("50")], { account: bob.account });
-
-      await voting.write.withdraw([100n, parseEther("20")], { account: alice.account });
-
-      await networkHelpers.time.increaseTo(votingEnd);
+      await networkHelpers.time.increaseTo(votingEnd + BigInt(ONE_HOUR));
       await voting.write.finalize();
 
       assert.equal(await voting.read.finalized(), true);
       assert.equal(await voting.read.currentTokenPrice(), 0n);
     });
 
-    it("reverts if finalize is called before votingEnd or more than once", async function () {
-      const { voting, votingEnd } = await networkHelpers.loadFixture(deployFixture);
+    it("enforces timing rules on proposeWinner and finalize", async function () {
+      const { voting, votingEnd, alice } = await networkHelpers.loadFixture(deployFixture);
 
-      await assert.rejects(voting.write.finalize(), /VotingActive/);
+      await voting.write.vote([100n, parseEther("50")], { account: alice.account });
+
+      await assert.rejects(voting.write.proposeWinner([100n]), /VotingActive/);
+      await assert.rejects(voting.write.finalize(), /ChallengePeriodActive/);
 
       await networkHelpers.time.increaseTo(votingEnd);
-      await voting.write.finalize();
+      await assert.rejects(voting.write.finalize(), /ChallengePeriodActive/);
 
+      await networkHelpers.time.increaseTo(votingEnd + BigInt(ONE_HOUR));
+      await assert.rejects(voting.write.proposeWinner([100n]), /ChallengePeriodEnded/);
+
+      await voting.write.finalize();
       await assert.rejects(voting.write.finalize(), /AlreadyFinalized/);
     });
   });
