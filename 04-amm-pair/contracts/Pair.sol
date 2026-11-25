@@ -42,32 +42,38 @@ contract Pair is ERC20 {
     function addLiquidity(uint256 amount0, uint256 amount1) external returns (uint256 liquidity) {
         if (amount0 == 0 || amount1 == 0) revert InsufficientAmount();
 
+        uint256 balance0Before = token0.balanceOf(address(this));
+        uint256 balance1Before = token1.balanceOf(address(this));
+
         token0.transferFrom(msg.sender, address(this), amount0);
         token1.transferFrom(msg.sender, address(this), amount1);
 
+        uint256 balance0After = token0.balanceOf(address(this));
+        uint256 balance1After = token1.balanceOf(address(this));
+
+        uint256 received0 = balance0After - balance0Before;
+        uint256 received1 = balance1After - balance1Before;
+
         uint256 _totalSupply = totalSupply();
         if (_totalSupply == 0) {
-            uint256 rootK = _sqrt(amount0 * amount1);
+            uint256 rootK = _sqrt(received0 * received1);
             if (rootK <= MINIMUM_LIQUIDITY) revert InsufficientLiquidity();
 
             liquidity = rootK - MINIMUM_LIQUIDITY;
-            // OpenZeppelin v5 ERC20 disallows _mint(address(0), ...), so permanently lock to DEAD_ADDRESS
             _mint(DEAD_ADDRESS, MINIMUM_LIQUIDITY);
         } else {
             liquidity = _min(
-                (amount0 * _totalSupply) / reserve0,
-                (amount1 * _totalSupply) / reserve1
+                (received0 * _totalSupply) / reserve0,
+                (received1 * _totalSupply) / reserve1
             );
         }
 
         if (liquidity == 0) revert InsufficientLiquidity();
 
         _mint(msg.sender, liquidity);
+        _syncReserves();
 
-        reserve0 += amount0;
-        reserve1 += amount1;
-
-        emit LiquidityAdded(msg.sender, amount0, amount1, liquidity);
+        emit LiquidityAdded(msg.sender, received0, received1, liquidity);
     }
 
     function removeLiquidity(uint256 liquidity) external returns (uint256 amount0, uint256 amount1) {
@@ -76,18 +82,20 @@ contract Pair is ERC20 {
         uint256 _totalSupply = totalSupply();
         if (_totalSupply == 0) revert InsufficientLiquidity();
 
-        amount0 = (liquidity * reserve0) / _totalSupply;
-        amount1 = (liquidity * reserve1) / _totalSupply;
+        uint256 balance0 = token0.balanceOf(address(this));
+        uint256 balance1 = token1.balanceOf(address(this));
+
+        amount0 = (liquidity * balance0) / _totalSupply;
+        amount1 = (liquidity * balance1) / _totalSupply;
 
         if (amount0 == 0 || amount1 == 0) revert InsufficientLiquidity();
 
         _burn(msg.sender, liquidity);
 
-        reserve0 -= amount0;
-        reserve1 -= amount1;
-
         token0.transfer(msg.sender, amount0);
         token1.transfer(msg.sender, amount1);
+
+        _syncReserves();
 
         emit LiquidityRemoved(msg.sender, amount0, amount1, liquidity);
     }
@@ -103,19 +111,25 @@ contract Pair is ERC20 {
         amountOut = getAmountOut(amountIn, reserveIn, reserveOut);
         if (amountOut < minAmountOut) revert InsufficientOutput();
 
+        uint256 kBefore = reserve0 * reserve1;
+
         if (isToken0) {
             token0.transferFrom(msg.sender, address(this), amountIn);
             token1.transfer(msg.sender, amountOut);
-            reserve0 += amountIn;
-            reserve1 -= amountOut;
         } else {
             token1.transferFrom(msg.sender, address(this), amountIn);
             token0.transfer(msg.sender, amountOut);
-            reserve1 += amountIn;
-            reserve0 -= amountOut;
         }
 
+        _syncReserves();
+        if (reserve0 * reserve1 < kBefore) revert InsufficientOutput();
+
         emit Swapped(msg.sender, tokenIn, amountIn, amountOut);
+    }
+
+    function _syncReserves() internal {
+        reserve0 = token0.balanceOf(address(this));
+        reserve1 = token1.balanceOf(address(this));
     }
 
     function _sqrt(uint256 y) internal pure returns (uint256 z) {
