@@ -48,11 +48,8 @@ contract Pair is ERC20 {
         token0.transferFrom(msg.sender, address(this), amount0);
         token1.transferFrom(msg.sender, address(this), amount1);
 
-        uint256 balance0After = token0.balanceOf(address(this));
-        uint256 balance1After = token1.balanceOf(address(this));
-
-        uint256 received0 = balance0After - balance0Before;
-        uint256 received1 = balance1After - balance1Before;
+        uint256 received0 = token0.balanceOf(address(this)) - balance0Before;
+        uint256 received1 = token1.balanceOf(address(this)) - balance1Before;
 
         uint256 _totalSupply = totalSupply();
         if (_totalSupply == 0) {
@@ -73,7 +70,7 @@ contract Pair is ERC20 {
         _mint(msg.sender, liquidity);
         _syncReserves();
 
-        emit LiquidityAdded(msg.sender, received0, received1, liquidity);
+        emit LiquidityAdded(msg.sender, amount0, amount1, liquidity);
     }
 
     function removeLiquidity(uint256 liquidity) external returns (uint256 amount0, uint256 amount1) {

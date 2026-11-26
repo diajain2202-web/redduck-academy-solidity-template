@@ -128,13 +128,14 @@ describe("Pair (pull-based AMM)", function () {
   });
 
   describe("removeLiquidity", function () {
-    it("burns LP tokens, returns pro-rata reserves, and syncs balances", async function () {
+    it("burns LP tokens, decreases totalSupply, returns pro-rata reserves, and syncs balances", async function () {
       const { pair, tokenA, tokenB, alice } = await deployFixture();
 
       await pair.write.addLiquidity([parseEther("100"), parseEther("100")]);
       await pair.write.addLiquidity([parseEther("100"), parseEther("100")], { account: alice.account });
 
       const aliceLP = await pair.read.balanceOf([alice.account.address]);
+      const totalSupplyBefore = await pair.read.totalSupply();
       const tokenABefore = await tokenA.read.balanceOf([alice.account.address]);
       const tokenBBefore = await tokenB.read.balanceOf([alice.account.address]);
 
@@ -146,6 +147,7 @@ describe("Pair (pull-based AMM)", function () {
       );
 
       assert.equal(await pair.read.balanceOf([alice.account.address]), 0n);
+      assert.equal(await pair.read.totalSupply(), totalSupplyBefore - aliceLP);
       assert.equal(await tokenA.read.balanceOf([alice.account.address]), tokenABefore + parseEther("100"));
       assert.equal(await tokenB.read.balanceOf([alice.account.address]), tokenBBefore + parseEther("100"));
       assert.equal(await pair.read.reserve0(), await tokenA.read.balanceOf([pair.address]));
